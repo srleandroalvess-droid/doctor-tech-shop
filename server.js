@@ -65,6 +65,29 @@ app.get('/admin/api/cj/search',wrap(async(q,r)=>{let k=String(q.query.keyword||'
 app.get('/admin/api/cj/variants',wrap(async(q,r)=>{if(!validId(q.query.pid))return r.status(400).json({error:'pid'});r.json({data:await cj('/product/variant/query?pid='+encodeURIComponent(q.query.pid)+'&features=enable_inventory')})}));
 app.post('/admin/api/cj/quote',wrap(async(q,r)=>{let {vid,country,zip}=q.body;if(!validId(vid)||! /^[A-Z]{2}$/.test(country)||! /^\d{8}$/.test(zip))return r.status(400).json({error:'input'});let v=await cj('/product/variant/queryByVid?vid='+encodeURIComponent(vid)+'&features=enable_inventory');let stock=v.inventories?.find(x=>x.countryCode===country);if(!(Number(stock?.totalInventory)>0))return r.status(409).json({error:'no_stock'});await new Promise(r=>setTimeout(r,1100));let freight=await cj('/logistic/freightCalculate',{startCountryCode:country,endCountryCode:'BR',zip,products:[{quantity:1,vid}]});let key=crypto.randomBytes(24).toString('hex');for(let [k,val] of quotes)if(Date.now()-val.at>1800000)quotes.delete(k);quotes.set(key,{session:token(q),v,stock,freight,country,zip,at:Date.now()});r.json({key,variant:v,stock,freight})}));
 
+// Read-only supplier audit and batch quotation. No purchase or publication.
+app.get('/admin/api/cj/audit',wrap(async(q,r)=>{
+ const suppliers=(await pool.query('SELECT id,name,origin,active FROM suppliers ORDER BY id')).rows;
+ const counts=(await pool.query('SELECT count(*)::int AS total,count(*) FILTER (WHERE cj_vid IS NOT NULL)::int AS linked FROM products')).rows[0];
+ await cj('/product/listV2?page=1&size=1&keyWord=router');
+ r.json({authenticated:true,suppliers,counts});
+}));
+app.post('/admin/api/cj/sync-preview',wrap(async(q,r)=>{
+ const {country,zip,rate}=q.body||{};const fx=Number(rate);
+ if(!/^[A-Z]{2}$/.test(country||'')||!/^\d{8}$/.test(zip||'')||!Number.isFinite(fx)||fx<=0||fx>=100)return r.status(400).json({error:'input'});
+ const rows=(await pool.query('SELECT id,name,cj_vid,origin,extra_cents,fee_bps,margin_bps,price_cents FROM products WHERE cj_vid IS NOT NULL AND id>$1 ORDER BY id LIMIT 3',[/^\d{1,10}$/.test(String(q.body.after||0))?Number(q.body.after||0):0])).rows;
+ const result=[];const wait=()=>new Promise(resolve=>setTimeout(resolve,1200));
+ for(const p of rows){let out={id:p.id,name:p.name,current_price_cents:p.price_cents};try{
+ if(!validId(p.cj_vid)||(p.origin==='Nacional')!==(country==='BR')){out.status='origin_review';result.push(out);continue}
+ const v=await cj('/product/variant/queryByVid?vid='+encodeURIComponent(p.cj_vid)+'&features=enable_inventory');await wait();
+ const stock=v.inventories?.find(x=>x.countryCode===country);out.stock=Number(stock?.totalInventory);if(!Number.isFinite(out.stock)||out.stock<=0){out.status='stock_unavailable';result.push(out);continue}
+ const options=await cj('/logistic/freightCalculate',{startCountryCode:country,endCountryCode:'BR',zip,products:[{quantity:1,vid:p.cj_vid}]});await wait();
+ const valid=(Array.isArray(options)?options:[]).filter(x=>x.logisticPrice!=null&&Number.isFinite(Number(x.logisticPrice))&&Number(x.logisticPrice)>=0).sort((a,b)=>Number(a.logisticPrice)-Number(b.logisticPrice));
+ if(!valid.length||v.variantSellPrice==null||!Number.isFinite(Number(v.variantSellPrice))||Number(v.variantSellPrice)<=0){out.status='quote_unavailable';result.push(out);continue}
+ out.cost_cents=cents(Math.ceil(Number(v.variantSellPrice)*fx*100));out.freight_cents=cents(Math.ceil(Number(valid[0].logisticPrice)*fx*100));out.shipping=String(valid[0].logisticName||'');out.delivery=String(valid[0].logisticAging||'');const calc=pricing(out.cost_cents,out.freight_cents,p.extra_cents,p.fee_bps,p.margin_bps);out.suggested_price_cents=calc?.price??null;out.profit_cents=calc?.profit??null;out.status=calc?'review_required':'costs_incomplete';
+ }catch(e){out.status='supplier_error';result.push(out);break}result.push(out)}
+ r.json({preview:true,country,zip,rate:fx,rows:result,next:result.length?result[result.length-1].id:null});
+}));
 function cents(x){if(x==null||x==='')return null;const n=Number(x);if(!Number.isSafeInteger(n)||n<0||n>2147483647)throw Error('invalid_pricing');return n}
 function bps(x){const n=cents(x);if(n!==null&&n>9000)throw Error('invalid_pricing');return n}
 function pricing(cost,freight,extra,fees,margin){if(cost===null||cost<=0||freight===null||extra===null||fees===null||margin===null)return null;if(fees+margin>=10000)throw Error('invalid_pricing');const total=cost+freight+extra,price=Math.ceil(total*10000/(10000-fees-margin));if(!Number.isSafeInteger(price)||price<=0||price>2147483647)throw Error('invalid_pricing');return {price,profit:price-total-Math.ceil(price*fees/10000)}}
