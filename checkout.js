@@ -60,6 +60,44 @@ app.post('/admin/api/checkout-orders/:id/payment-link',run(async(q,r)=>{
 const id=q.params.id;if(!idOk(id))throw fail(400,'input');const b=q.body||{};if(b.confirmed!==true)throw fail(400,'payment_url');const link=paymentLink(b.url);
 const x=await pool.query("UPDATE checkout_orders SET payment_url=$1,updated_at=now() WHERE id=$2 AND status='confirmed' AND total_cents=$3 AND total_cents>0 RETURNING id,reference,payment_url",[link,id,integer(b.total_cents,1,Number.MAX_SAFE_INTEGER)?b.total_cents:0]);if(!x.rowCount)throw fail(409,'transition');r.json({order:x.rows[0]})
 }));
+
+/* Production Checkout Pro: explicit deployment gate; no automatic charge creation. */
+const mpEnabled=()=>process.env.MP_COMMERCIAL_ENABLED==='true';
+async function mpGet(route){const access=(process.env.MP_ACCESS_TOKEN||'').trim();if(!/^APP_USR-/.test(access))throw fail(503,'mp_credentials');const a=await fetch('https://api.mercadopago.com'+route,{headers:{Authorization:'Bearer '+access},signal:AbortSignal.timeout(12000)});if(!a.ok)throw fail(502,'mp_upstream');return a.json()}
+app.post('/admin/api/checkout-orders/:id/mp-preference',run(async(q,r)=>{
+ if(!mpEnabled())throw fail(503,'commercial_disabled');
+ if(!idOk(q.params.id)||q.body?.confirmed!==true)throw fail(400,'input');
+ const seller=await mpGet('/users/me');if(!seller.id||seller.site_id!=='MLB'||!Array.isArray(seller.tags)||seller.tags.includes('test_user'))throw fail(503,'mp_identity');
+ const result=await tx(pool,async c=>{
+ const o=(await c.query("SELECT * FROM checkout_orders WHERE id=$1 FOR UPDATE",[q.params.id])).rows[0];
+ if(!o||o.status!=='confirmed'||Number(o.total_cents)<=0)throw fail(409,'transition');
+ if(o.payment_url)return {url:o.payment_url,duplicate:true};
+ const items=(await c.query('SELECT i.*,p.active,p.sale_approved_until FROM checkout_order_items i JOIN products p ON p.id=i.product_id JOIN suppliers s ON s.id=p.supplier_id WHERE i.order_id=$1 AND '+commercial+' AND p.sale_approved_until>now() AND p.stock_confirmed_at IS NOT NULL FOR UPDATE OF p,s',[o.id])).rows;
+ const count=(await c.query('SELECT count(*)::int n FROM checkout_order_items WHERE order_id=$1',[o.id])).rows[0].n;
+ if(!items.length||items.length!==count||items.some(i=>Number(i.unit_price_cents)<=0))throw fail(409,'unavailable');
+ const sum=items.reduce((n,i)=>n+Number(i.unit_price_cents)*i.quantity,0)+Number(o.shipping_cents);
+ if(sum!==Number(o.total_cents))throw fail(409,'amount');
+ const a=await fetch('https://api.mercadopago.com/checkout/preferences',{method:'POST',headers:{Authorization:'Bearer '+process.env.MP_ACCESS_TOKEN.trim(),'Content-Type':'application/json','X-Idempotency-Key':crypto.createHash('sha256').update('DT-pref-'+o.reference).digest('hex')},body:JSON.stringify({items:[{id:o.reference,title:'Pedido Doctor Tech '+o.reference,quantity:1,currency_id:'BRL',unit_price:sum/100}],external_reference:o.reference,notification_url:'https://doctortechshop.com.br/webhooks/mercadopago/production',back_urls:{success:'https://doctortechshop.com.br/conta/pedidos',pending:'https://doctortechshop.com.br/conta/pedidos',failure:'https://doctortechshop.com.br/conta/pedidos'},expires:true,expiration_date_to:new Date(Date.now()+15*60000).toISOString()}),signal:AbortSignal.timeout(15000)});
+ if(!a.ok)throw fail(502,'mp_preference');const j=await a.json();if(String(j.collector_id)!==String(seller.id)||j.external_reference!==o.reference)throw fail(502,'mp_identity');
+ const url=paymentLink(j.init_point);await c.query('UPDATE checkout_orders SET payment_url=$1,updated_at=now() WHERE id=$2',[url,o.id]);return {url,duplicate:false};
+ });r.json(result)
+}));
+app.get('/admin/api/mp/commercial-status',run(async(q,r)=>r.json({enabled:mpEnabled(),mode:'production',methods:['pix','credit_card'],automaticReconciliation:true})));
+app.locals.mpReconcile=async function(id){
+ if(!mpEnabled())return;
+ if(!/^\d{1,30}$/.test(id))throw fail(400,'payment_id');
+ const p=await mpGet('/v1/payments/'+id),seller=await mpGet('/users/me');
+ if(String(p.id)!==id||p.live_mode!==true||String(p.collector_id)!==String(seller.id)||p.currency_id!=='BRL'||!/^DT-[A-F0-9]{18}$/.test(p.external_reference||''))return;
+ if(p.status!=='approved'){console.info('MP payment requires review',p.status);return}
+ await tx(pool,async c=>{
+ await c.query('SELECT pg_advisory_xact_lock(hashtext($1))',['mp-payment-'+id]);
+ const o=(await c.query('SELECT * FROM checkout_orders WHERE reference=$1 FOR UPDATE',[p.external_reference])).rows[0];
+ if(!o||o.status!=='confirmed'||Math.round(Number(p.transaction_amount)*100)!==Number(o.total_cents)||!o.payment_url)return;
+ const duplicate=await c.query('SELECT id FROM checkout_orders WHERE payment_reference=$1',['MP-'+id]);if(duplicate.rowCount)return;
+ const fees=Array.isArray(p.fee_details)&&p.fee_details.length?p.fee_details.reduce((n,f)=>n+Math.round(Number(f.amount)*100),0):null;
+ await c.query("UPDATE checkout_orders SET status='paid',payment_reference=$1,payment_fee_cents=$2,payment_confirmed_at=now(),payment_url=NULL,updated_at=now() WHERE id=$3 AND status='confirmed'",['MP-'+id,Number.isSafeInteger(fees)&&fees>=0&&fees<=Number(o.total_cents)?fees:null,o.id]);
+ });
+};
 app.get('/admin/api/checkout-finance',run(async(q,r)=>{
 const x=await pool.query("SELECT count(*)::int AS orders,count(*) FILTER (WHERE status IN ('paid','shipped','delivered'))::int AS paid_orders,COALESCE(sum(total_cents) FILTER (WHERE status IN ('paid','shipped','delivered')),0) AS gross_cents,COALESCE(sum(payment_fee_cents) FILTER (WHERE status IN ('paid','shipped','delivered')),0) AS known_payment_fees_cents,count(*) FILTER (WHERE status IN ('paid','shipped','delivered') AND payment_fee_cents IS NULL)::int AS missing_fee_count FROM checkout_orders");r.json(x.rows[0])
 }));
