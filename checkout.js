@@ -57,6 +57,7 @@ const x=await c.query("UPDATE products SET stock_confirmed_quantity=$1,stock_con
 app.post('/admin/api/checkout-products/:id/pause',run(async(q,r)=>{if(!idOk(q.params.id))throw fail(400,'input');const x=await pool.query('UPDATE products SET sale_approved_until=NULL,stock_confirmed_quantity=NULL,stock_confirmed_at=NULL,sale_approval_note=NULL WHERE id=$1 RETURNING id',[q.params.id]);if(!x.rowCount)throw fail(404,'not_found');r.json({ok:true})}));
 app.get('/admin/api/checkout-orders',run(async(q,r)=>{const before=q.query.before;let where='true',args=[];if(before){if(!idOk(before))throw fail(400,'input');where='o.id<$1';args=[before]}r.json(await listOrders(pool,where,args,true))}));
 app.post('/admin/api/checkout-orders/:id/payment-link',run(async(q,r)=>{
+if(process.env.MP_COMMERCIAL_ENABLED!=='true')throw fail(503,'commercial_disabled');
 const id=q.params.id;if(!idOk(id))throw fail(400,'input');const b=q.body||{};if(b.confirmed!==true)throw fail(400,'payment_url');const link=paymentLink(b.url);
 const x=await pool.query("UPDATE checkout_orders SET payment_url=$1,updated_at=now() WHERE id=$2 AND status='confirmed' AND total_cents=$3 AND total_cents>0 RETURNING id,reference,payment_url",[link,id,integer(b.total_cents,1,Number.MAX_SAFE_INTEGER)?b.total_cents:0]);if(!x.rowCount)throw fail(409,'transition');r.json({order:x.rows[0]})
 }));
@@ -108,7 +109,7 @@ const x=await c.query('SELECT * FROM checkout_orders WHERE id=$1 FOR UPDATE',[id
 const transitions={requested:['confirmed','cancelled'],confirmed:['paid','cancelled'],paid:['shipped'],shipped:['delivered'],delivered:[],cancelled:[]};if(!transitions[o.status]?.includes(b.status))throw fail(409,'transition');
 let shipping=o.shipping_cents,total=o.total_cents,tracking=o.tracking,paymentRef=o.payment_reference,paymentFee=o.payment_fee_cents;
 if(b.status==='confirmed'){if(!integer(b.shipping_cents,0,10000000)||b.confirmed!==true)throw fail(400,'shipping');shipping=b.shipping_cents;total=Number(o.subtotal_cents)+shipping;if(!Number.isSafeInteger(total))throw fail(400,'shipping')}
-if(b.status==='paid'){paymentRef=str(b.payment_reference,3,120);paymentFee=b.payment_fee_cents===null?null:b.payment_fee_cents;if(b.confirmed!==true||!paymentRef||!integer(b.received_cents,1,Number.MAX_SAFE_INTEGER)||b.received_cents!==Number(o.total_cents)||(paymentFee!==null&&!integer(paymentFee,0,b.received_cents)))throw fail(400,'payment')}
+if(b.status==='paid'){if(!mpEnabled())throw fail(503,'commercial_disabled');paymentRef=str(b.payment_reference,3,120);paymentFee=b.payment_fee_cents===null?null:b.payment_fee_cents;if(b.confirmed!==true||!paymentRef||!integer(b.received_cents,1,Number.MAX_SAFE_INTEGER)||b.received_cents!==Number(o.total_cents)||(paymentFee!==null&&!integer(paymentFee,0,b.received_cents)))throw fail(400,'payment')}
 if(b.status==='shipped'){tracking=str(b.tracking,2,120);if(!tracking)throw fail(400,'tracking')}
 const y=await c.query("UPDATE checkout_orders SET status=$1,shipping_cents=$2,total_cents=$3,tracking=$4,payment_reference=$6,payment_fee_cents=$7,payment_confirmed_at=CASE WHEN $1='paid' THEN now() ELSE payment_confirmed_at END,payment_url=CASE WHEN $1 IN ('paid','cancelled') THEN NULL ELSE payment_url END,updated_at=now() WHERE id=$5 RETURNING "+profileCols,[b.status,shipping,total,tracking,id,paymentRef,paymentFee]);return y.rows[0];
 });r.json({order:result})
