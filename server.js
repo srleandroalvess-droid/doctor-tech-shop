@@ -10,6 +10,7 @@ app.post('/admin/api/login',(q,r)=>{const user=process.env.ADMIN_USER||'admin',p
 app.use('/admin/api',auth);
 require('./accounts')(app,pool);
 require('./checkout')(app,pool);
+require('./b2b')(app,pool);
 /* Production readiness only: no payment creation, no order transitions. */
 async function mpProductionStatus(){
  const access=(process.env.MP_ACCESS_TOKEN||'').trim(), key=(process.env.MP_PUBLIC_KEY||'').trim();
@@ -65,12 +66,14 @@ app.post('/admin/api/homologacao/mp/orders-v2',async(q,r)=>{
  try{
  const diagnostic=await mpTestDiagnostic('MP_ORDERS_TEST');if(!diagnostic.sellerVerified)return r.status(503).json({error:'test_seller_not_verified'});
  const ref='MPORDERTEST-'+crypto.randomBytes(16).toString('hex');
- const a=await fetch('https://api.mercadopago.com/v1/orders',{method:'POST',headers:{Authorization:'Bearer '+access,'Content-Type':'application/json','X-Idempotency-Key':crypto.randomUUID()},body:JSON.stringify({type:'online',processing_mode:'manual',total_amount:'1.00',external_reference:ref,items:[{title:'Doctor Tech - produto ficticio de teste',quantity:1,unit_price:'1.00'}]}),signal:AbortSignal.timeout(15000)});
+ const requestBody={type:'online',processing_mode:'manual',total_amount:'1.00',external_reference:ref,items:[{title:'Doctor Tech - produto ficticio de teste',quantity:1,unit_price:'1.00'}]};
+ const attemptedAt=new Date().toISOString();
+ const a=await fetch('https://api.mercadopago.com/v1/orders',{method:'POST',headers:{Authorization:'Bearer '+access,'Content-Type':'application/json','X-Idempotency-Key':crypto.randomUUID()},body:JSON.stringify(requestBody),signal:AbortSignal.timeout(15000)});
  const j=await a.json();
  if(!a.ok){console.warn('MP Orders test create HTTP',a.status);return r.status(502).json({error:'orders_create_failed',http:a.status})}
  if(!/^ORDTST[A-Z0-9]+$/.test(String(j.id))||j.external_reference!==ref||j.processing_mode!=='manual'||j.status!=='created'||j.currency!=='BRL'||Number(j.total_amount)!==1)return r.status(502).json({error:'orders_test_not_verified'});
  const u=new URL(j.checkout_url);if(u.origin!=='https://www.mercadopago.com.br'||u.username||u.password||u.pathname!=='/checkout/v1/redirect'||u.searchParams.get('order_id')!==j.id)return r.status(502).json({error:'orders_url_invalid'});
- r.json({id:j.id,url:u.href});
+ r.json({id:j.id,url:u.href,diagnostic:{ticket:'WCS-60379',attemptedAt,credentialSource:'MP_ORDERS_TEST_ACCESS_TOKEN',sellerId:'3877273267',request:requestBody,http:a.status,requestId:a.headers.get('x-request-id'),response:{id:j.id,status:j.status,status_detail:j.status_detail,external_reference:j.external_reference,processing_mode:j.processing_mode,currency:j.currency,total_amount:j.total_amount,checkout_url:u.href}}});
  }catch(e){r.status(502).json({error:'orders_unavailable'})}
 });
 app.get('/admin/api/homologacao/mp/orders-v2/:id',async(q,r)=>{
