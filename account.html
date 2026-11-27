@@ -16,4 +16,4 @@ $('register').onsubmit=e=>{e.preventDefault();submit(e.target,async()=>{if($('pa
 $('change').onsubmit=e=>{e.preventDefault();submit(e.target,async()=>{if($('next').value!==$('nextConfirm').value)throw Error('As novas senhas não coincidem.');await api('password',Object.fromEntries(new FormData(e.target)));e.target.reset();guest();message('Senha atualizada. Entre novamente.')})};
 $('logout').onclick=async()=>{try{await api('logout',{});guest();message('Sessão encerrada.')}catch(e){message(e.message)}};
 api('me').then(r=>show(r.account)).catch(e=>{if(e.status!==401)message(e.message)});
-</script></body></html>
+</script></body><nav style="padding:16px"><a href="/conta/provedor">Portal do provedor e atendimento</a></nav></html>
