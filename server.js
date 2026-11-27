@@ -11,6 +11,7 @@ app.use('/admin/api',auth);
 require('./accounts')(app,pool);
 require('./checkout')(app,pool);
 require('./b2b')(app,pool);
+require('./dt3')(app,pool);
 /* Production readiness only: no payment creation, no order transitions. */
 async function mpProductionStatus(){
  const access=(process.env.MP_ACCESS_TOKEN||'').trim(), key=(process.env.MP_PUBLIC_KEY||'').trim();
