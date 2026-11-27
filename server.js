@@ -24,7 +24,7 @@ async function mpProductionStatus(){
  }catch{return {...result,reason:'unavailable'}}
 }
 app.get('/admin/api/mp/production/status',async(q,r)=>r.json(await mpProductionStatus()));
-app.post('/webhooks/mercadopago/production',(q,r)=>{
+app.post('/webhooks/mercadopago/production',async(q,r)=>{
  const secret=(process.env.MP_WEBHOOK_SECRET||'').trim();
  if(!secret)return r.sendStatus(503);
  const id=q.query['data.id'],rid=q.get('x-request-id'),sig=q.get('x-signature')||'';
@@ -33,7 +33,10 @@ app.post('/webhooks/mercadopago/production',(q,r)=>{
  const expected=crypto.createHmac('sha256',secret).update('id:'+id.toLowerCase()+';request-id:'+rid+';ts:'+ts+';').digest();
  if(!crypto.timingSafeEqual(expected,Buffer.from(v1,'hex')))return r.sendStatus(401);
  // Readiness only: acknowledge signed notification without changing any order.
- console.info('MP signed production webhook received; commercial processing disabled');
+ if(process.env.MP_COMMERCIAL_ENABLED==='true' && q.body?.type==='payment'){
+ try{await app.locals.mpReconcile(id)}catch(e){console.warn('MP reconciliation failed',e.publicCode||e.name);return r.sendStatus(503)}
+ }
+ console.info('MP signed production webhook received');
  return r.sendStatus(200);
 });
 mpProductionStatus().then(s=>console.info('MP production readiness',JSON.stringify(s))).catch(()=>console.warn('MP readiness unavailable'));
